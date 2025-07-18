@@ -24,11 +24,18 @@ Save the checkpoints to `configs/flashdepth/iter_43002.pth`, `configs/flashdepth
 To run inference on a video:
 ```
 torchrun train.py --config-path configs/flashdepth inference=true eval.random_input=<path to video> eval.outfolder=output
+``` 
+To run inference on a video with PNG output
 ```
+torchrun train.py --config-path configs/flashdepth inference=true eval.random_input=<path to video> eval.outfolder=output
+```
+
+
+
 The output depth maps (as npy files) and mp4s will be saved to `configs/flashdepth/output/`. Change the configs path to use another model. We provide some examples: 
 ```
 torchrun train.py --config-path configs/flashdepth inference=true eval.random_input=examples/video1.mp4 eval.outfolder=output
-torchrun train.py --config-path configs/flashdepth inference=true eval.random_input=examples/video2.mp4 eval.outfolder=output
+torchrun train.py --config-path configs/flashdepth inference=true eval.random_input=examples/video2.mp4 eval.outfolder=output eval.save_png_sequence=true eval.out_mp4=false
 ```
 
 **If you run into `TypeError: Invalid NaN comparison` errors, add `eval.compile=false` to the command.
