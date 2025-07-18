@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
+from torchvision.utils import save_image 
 
 from utils.init_setup import dist_init, setup_model, save_checkpoint
 # from utils.helpers import 
@@ -86,8 +87,6 @@ def validation(cfg, model, train_step, test_dataloader):
     for key in next(iter(val_losses.values())).keys():  # Get all loss types from first dataset
         avg_losses[key] = sum(dataset_losses[key] for dataset_losses in val_losses.values()) / len(val_losses)
     
-    # logging.info(f"Validation loss at step {train_step}: {avg_losses['abs_rel']:.4f}, {avg_losses['l1_loss']:.4f}")
-
     if rank == 0 and cfg.training.wandb:
         # Log per-dataset losses
         for dataset_name, losses in val_losses.items():
@@ -96,7 +95,6 @@ def validation(cfg, model, train_step, test_dataloader):
         wandb.log({f"avg/{k}": v for k, v in avg_losses.items()}, step=train_step)
         
         if grid is not None:
-            # grid['stacked_frames']: N, 3, H, W (take every 5th for now to save space)
             wandb.log({"vis_val": wandb.Video(grid['stacked_frames'][::5], fps=10, format="gif")}, step=train_step)
     
     model.train()
@@ -113,8 +111,10 @@ def inference(cfg, process_dict):
     if cfg.eval.compile:
         model = torch.compile(model) 
 
-    savepath = os.path.join(cfg.config_dir, cfg.eval.outfolder)
-    os.makedirs(savepath, exist_ok=True)
+    base_savepath = os.path.join(cfg.config_dir, cfg.eval.outfolder)
+    os.makedirs(base_savepath, exist_ok=True)
+
+    save_png_sequence = cfg.eval.get('save_png_sequence', False)
 
     eval_args = {
         'save_depth_npy': cfg.eval.save_depth_npy,
@@ -129,54 +129,71 @@ def inference(cfg, process_dict):
         'use_metrics': False,
         'dummy_timing': cfg.eval.dummy_timing
     }
-
     
     if cfg.eval.dummy_timing:
         test_dataloader = [torch.randn(1, 105, 3, 1148, 2044)]*3
-
     elif cfg.eval.random_input is not None:
         dataset = RandomDataset(root_dir=cfg.eval.random_input, resolution=cfg.dataset.resolution, large_dir=cfg.eval.large_dir)
-        test_dataloader = DataLoader(dataset, batch_size=1, num_workers=0, 
-                                 shuffle=False, drop_last=False) 
-        
+        test_dataloader = DataLoader(dataset, batch_size=1, num_workers=0, shuffle=False, drop_last=False) 
     else:
         dataset = CombinedDataset(root_dir=cfg.dataset.data_root, enable_dataset_flags=cfg.eval.test_datasets, 
                                   split='test', resolution=cfg.eval.test_dataset_resolution)
-        test_dataloader = DataLoader(dataset, batch_size=1, num_workers=0, 
-                                 shuffle=False, drop_last=False) 
+        test_dataloader = DataLoader(dataset, batch_size=1, num_workers=0, shuffle=False, drop_last=False) 
         
-
-    for test_idx, batch in enumerate(tqdm(test_dataloader)):        
+    for test_idx, batch in enumerate(tqdm(test_dataloader)):
+        scene_name_str = f"item_{test_idx}"
         if isinstance(batch, list) or isinstance(batch, tuple):
-            if len(batch) == 3:
-                video, gt_depth, dataset_scene_name = batch
-                logging.info(f'gt shape: {gt_depth.shape}')
-            else:
-                video, dataset_scene_name = batch
-                gt_depth = None
-            savepath = os.path.join(cfg.config_dir, cfg.eval.outfolder, dataset_scene_name[0])
-            batch = (video, gt_depth)
-            logging.info(f'batch shape: {batch[0].shape}')
+            if len(batch) == 3: video, gt_depth, dataset_scene_name = batch; scene_name_str = dataset_scene_name[0].replace('/', '_')
+            else: video, dataset_scene_name = batch; gt_depth = None; scene_name_str = dataset_scene_name[0].replace('/', '_')
+            savepath = os.path.join(base_savepath, scene_name_str); batch = (video, gt_depth); logging.info(f'batch shape: {batch[0].shape}')
         elif isinstance(batch, dict):
-            batch, scene_name = batch['batch'], batch['scene_name'][0]
-            logging.info(f'shape: {batch.shape}, {scene_name}')
-            savepath = os.path.join(cfg.config_dir, cfg.eval.outfolder, scene_name)
-            os.makedirs(savepath, exist_ok=True)
-        else:
-            logging.info(f'shape: {batch.shape}')
+            batch, scene_name_str = batch['batch'], batch['scene_name'][0]; savepath = os.path.join(base_savepath, scene_name_str.replace('/', '_')); logging.info(f'shape: {batch.shape}, {scene_name_str}')
+        else: savepath = os.path.join(base_savepath, scene_name_str); logging.info(f'shape: {batch.shape}')
+        os.makedirs(savepath, exist_ok=True)
 
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-            _, img_grid = model(
-                batch, 
-                gif_path=f'{savepath}/{os.path.basename(cfg.config_dir.rstrip("/"))}_{train_step}_{test_idx}.gif',
-                **eval_args
-                )
+            _, grid_dict = model(batch, gif_path=f'{savepath}/tmp.gif', **eval_args)
 
-        if cfg.eval.save_grid:
-            img_grid.save(f'{savepath}/{os.path.basename(cfg.config_dir.rstrip("/"))}_{train_step}_{test_idx}.png')
+        if save_png_sequence and grid_dict is not None and isinstance(grid_dict, dict):
+            
+            # 'stacked_frames' is the correct key.
+            # It contains the side-by-side visualization grid.
+            key_for_visual_grid = 'stacked_frames'
 
+            if key_for_visual_grid not in grid_dict:
+                 logging.error(f"The key '{key_for_visual_grid}' was not found in the model output! Aborting.")
+                 continue
 
-    
+            visual_grid_output = grid_dict[key_for_visual_grid]
+            
+            # Convert to a float tensor for processing
+            if isinstance(visual_grid_output, torch.Tensor):
+                side_by_side_tensor = visual_grid_output.float()
+            else: # Assumes numpy array
+                side_by_side_tensor = torch.from_numpy(visual_grid_output).float()
+
+            # --- THE CROP LOGIC ---
+            # The tensor contains two images side-by-side. We want only the right half (the depth map).
+            _, _, _, total_width = side_by_side_tensor.shape
+            single_image_width = total_width // 2
+
+            logging.info(f"Cropping side-by-side grid of width {total_width} to get depth map of width {single_image_width}.")
+            
+            # Slice the tensor to get the right half
+            depth_only_tensor = side_by_side_tensor[:, :, :, single_image_width:]
+            # --- END OF CROP LOGIC ---
+
+            frames_folder = os.path.join(savepath, "frames")
+            os.makedirs(frames_folder, exist_ok=True)
+
+            num_frames = depth_only_tensor.shape[0]
+            logging.info(f"Saving {num_frames} cropped depth frames to {frames_folder}...")
+
+            for i in range(num_frames):
+                current_frame = depth_only_tensor[i] 
+                frame_path = os.path.join(frames_folder, f"frame_{str(i).zfill(5)}.png")
+                save_image(current_frame, frame_path, normalize=True)
+
 
 def main(cfg, process_dict):
 
@@ -192,17 +209,14 @@ def main(cfg, process_dict):
     test_dataloader = DataLoader(test_dataset, batch_size=1, num_workers=0, 
                                  shuffle=False, drop_last=True, sampler=test_sampler)
 
-
     # init model
     model, optimizer, lr_scheduler, train_step = setup_model(cfg, process_dict)
-
     logging.info(f"Starting training at step {train_step}")
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
     logging.info(f"Total parameters: {total_params:,}")
     logging.info(f"Trainable parameters: {trainable_params:,} ({100 * trainable_params / total_params:.2f}%)")
-
 
     # init logging (wandb)
     wandb_mode = "online" if (process_dict['rank'] == 0 and cfg.training.wandb) else "disabled"
@@ -218,7 +232,6 @@ def main(cfg, process_dict):
     if cfg.training.start_with_val:
         validation(cfg, model, train_step, test_dataloader)
 
-
     # start training loop
     total_iters = cfg.training.total_iters; epoch = 1
     pbar = tqdm(total=total_iters, initial=train_step, disable=(dist.get_rank() != 0))
@@ -229,16 +242,14 @@ def main(cfg, process_dict):
             batch = next(train_iterators[current_loader_idx])
         except StopIteration:
             epoch += 1
-            # Reset the iterator that ran out of batches
             dataloaders[current_loader_idx].sampler.set_epoch(train_step)
             train_iterators[current_loader_idx] = iter(dataloaders[current_loader_idx])
             batch = next(train_iterators[current_loader_idx])
         
         video, gt_depth, dataset_name = batch
-        dataset_name = dataset_name[0] if isinstance(dataset_name, tuple) else dataset_name # means each dataloader is separate
-        dataset_name = 'total' if isinstance(dataset_name, list) else dataset_name # means all dataloaders are combined
+        dataset_name = dataset_name[0] if isinstance(dataset_name, tuple) else dataset_name
+        dataset_name = 'total' if isinstance(dataset_name, list) else dataset_name
 
-        # forward + loss
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
             vis_training = train_step if train_idx % cfg.training.vis_freq == 0 else 0
             vis_training = train_idx+1 if train_idx<10 else vis_training
@@ -250,19 +261,12 @@ def main(cfg, process_dict):
                 vis_training=vis_training, savedir=os.path.join(cfg.config_dir, 'train_vis_debug'))
 
             if vis_training and grid is not None:
-                # shape: time, channels, height, width (https://docs.wandb.ai/guides/track/log/media/)
-                # wandb.log({"vis_train": wandb.Video(grid['stacked_frames'], fps=4, format="gif")}, step=train_step)
                 wandb.log({"vis_train_grid": wandb.Image(grid['grid_img'])}, step=train_step)
-
-                
             loss = loss / cfg.training.gradient_accumulation
 
         loss.backward()
 
-        
         if (train_idx+1) % cfg.training.gradient_accumulation == 0:
-            # do not step if gradients include nan or infs
-            # if has_valid_gradients(model, train_step, loss):
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
@@ -273,15 +277,11 @@ def main(cfg, process_dict):
             for i, param_group in enumerate(optimizer.param_groups):
                 logging.info(f"Step {train_step}, Group {i + 1} LR: {param_group['lr']:.2e}")
 
-        # logging and checkpointing 
         pbar.set_description(f"training - epoch: {epoch}, loss of {dataset_name}: {loss.detach().item()*cfg.training.gradient_accumulation:.3f}")
-        if cfg.training.wandb: 
-            if process_dict['rank'] == 0:
-                loss_details = {'loss': {}}
-                loss_details['loss'][dataset_name] = loss.detach().item()*cfg.training.gradient_accumulation 
-
-                wandb.log(loss_details, step=train_step)  
-
+        if cfg.training.wandb and process_dict['rank'] == 0: 
+            loss_details = {'loss': {}}
+            loss_details['loss'][dataset_name] = loss.detach().item()*cfg.training.gradient_accumulation 
+            wandb.log(loss_details, step=train_step)  
 
         if train_idx!=0 and train_idx % cfg.training.save_freq == 0:
             save_checkpoint(cfg, model, optimizer, lr_scheduler, train_step)
@@ -299,11 +299,8 @@ def setup(cfg: DictConfig):
     process_dict = dist_init()
     logging_config.configure_logging()
     
-    # logging.info(OmegaConf.to_yaml(cfg))
-
     hydra_cfg = HydraConfig.get()
     cfg.config_dir = [path["path"] for path in hydra_cfg.runtime.config_sources if path["schema"] == "file"][0]
-
  
     if cfg.inference:
         inference(cfg, process_dict)
